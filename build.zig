@@ -1,8 +1,17 @@
 const std = @import("std");
+const GitRepoStep = @import("GitRepoStep.zig");
 
 pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
+
+    const zigx_repo = GitRepoStep.create(b, .{
+        .url = "https://github.com/marler8997/zigx",
+        .branch = null,
+        .sha = "5a46e3ee7956739dc678efd82e4fe04b4d349cd2",
+    });
+    // TODO: use this
+    _ = zigx_repo;
 
     {
         const exe = b.addExecutable("xremoteview", "xremoteview.zig");
