@@ -8,17 +8,31 @@ const global = struct {
     pub var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 };
 
+fn initUnixAddr(path: []const u8) error{PathTooLong}!os.sockaddr.un {
+    var result: os.sockaddr.un = .{ .family = os.AF.UNIX, .path = undefined };
+    if (path.len + 1 > result.path.len) return error.PathTooLong;
+    std.mem.copy(u8, &result.path, path);
+    result.path[path.len] = 0;
+    return result;
+}
+
 fn createServer(listen_path: []const u8) !os.socket_t {
-    var addr: os.sockaddr.un = .{ .family = os.AF.UNIX, .path = undefined };
-    std.debug.assert(listen_path.len + 1 <= addr.path.len);
-    std.mem.copy(u8, &addr.path, listen_path);
-    addr.path[listen_path.len] = 0;
+    const addr = try initUnixAddr(listen_path);
 
     const sock = try os.socket(os.AF.UNIX, os.SOCK.STREAM, 0);
     errdefer os.close(sock);
 
-    try os.bind(sock, @ptrCast(*os.sockaddr, &addr), @sizeOf(@TypeOf(addr)));
+    try os.bind(sock, @ptrCast(*const os.sockaddr, &addr), @sizeOf(@TypeOf(addr)));
     try os.listen(sock, 0);
+    return sock;
+}
+fn connectXserver() !os.socket_t {
+    // TODO: hardcoded path for now
+    const addr = try initUnixAddr("/tmp/.X11-unix/X0");
+    const sock = try os.socket(os.AF.UNIX, os.SOCK.STREAM, 0);
+    errdefer os.close(sock);
+
+    try os.connect(sock, @ptrCast(*const os.sockaddr, &addr), @sizeOf(@TypeOf(addr)));
     return sock;
 }
 
@@ -41,9 +55,15 @@ pub fn main() !u8 {
     const listen_sock = try createServer(listen_path);
     std.log.info("listening at '{s}', DISPLAY=:8", .{listen_path});
 
-    try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, listen_sock, os.linux.EPOLL.IN, .listen_sock);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}) {};
+    //defer gpa.deinit();
 
-    var data_sock: os.socket_t = -1;
+    var listen_sock_handler = ListenSockHandler{
+        .epoll_fd = epoll_fd,
+        .allocator = gpa.allocator(),
+        .sock = listen_sock,
+    };
+    try epollAddHandler(epoll_fd, listen_sock, &listen_sock_handler.base);
 
     while (true) {
         var events : [10]os.linux.epoll_event = undefined;
@@ -53,63 +73,159 @@ pub fn main() !u8 {
             else => |e| std.debug.panic("epoll_wait failed, errno={}", .{e}),
         }
         for (events[0..count]) |*event| {
-            switch (@intToEnum(EpollHandler, event.data.@"u32")) {
-                .listen_sock => try onListenSock(epoll_fd, listen_sock, &data_sock),
-                .data_sock => try onDataSock(&data_sock),
-            }
+            const handler = @intToPtr(*EpollHandler, event.data.ptr);
+            handler.handle(handler) catch |err| switch (err) {
+                error.Handled => {},
+                else => |e| return e,
+            };
         }
     }
 }
 
-const EpollHandler = enum {
-    listen_sock,
-    data_sock,
+const EpollHandler = struct {
+    handle: fn(base: *EpollHandler) anyerror!void,
+};
+fn epollAddHandler(epoll_fd: os.fd_t, fd: os.fd_t, handler: *EpollHandler) !void {
+    var event = os.linux.epoll_event {
+        .events = os.linux.EPOLL.IN,
+        .data = os.linux.epoll_data { .ptr = @ptrToInt(handler) },
+    };
+    try os.epoll_ctl(epoll_fd, os.linux.EPOLL.CTL_ADD, fd, &event);
+}
+
+const ListenSockHandler = struct {
+    base: EpollHandler = .{ .handle = handle },
+    epoll_fd: os.fd_t,
+    allocator: std.mem.Allocator,
+    sock: os.socket_t,
+    fn handle(base: *EpollHandler) !void {
+        const self = @fieldParentPtr(ListenSockHandler, "base", base);
+
+        var addr: os.sockaddr.un = undefined;
+        var len: os.socklen_t = @sizeOf(@TypeOf(addr));
+
+        const new_fd = os.accept(self.sock, @ptrCast(*os.sockaddr, &addr), &len, os.SOCK.CLOEXEC) catch |err| switch (err) {
+            error.ConnectionAborted,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            error.SystemResources,
+            error.ProtocolFailure,
+            error.BlockedByFirewall,
+            error.WouldBlock,
+            error.ConnectionResetByPeer,
+            error.NetworkSubsystemFailed,
+            => |e| {
+                std.log.info("accept failed with {s}", .{@errorName(e)});
+                return;
+            },
+            error.FileDescriptorNotASocket,
+            error.SocketNotListening,
+            error.OperationNotSupported,
+            error.Unexpected,
+            => unreachable,
+        };
+        errdefer os.close(new_fd);
+
+        const forward_sock = try connectXserver();
+
+        const new_handler = self.allocator.create(DataSockHandler) catch |err| switch (err) {
+            error.OutOfMemory => {
+                std.log.err("s={}: failed to allocate handler", .{new_fd});
+                return error.Handled;
+            },
+        };
+        errdefer self.allocator.destroy(new_handler);
+        new_handler.* = .{
+            .allocator = self.allocator,
+            .client_sock = new_fd,
+            .forward_sock = forward_sock,
+        };
+        epollAddHandler(self.epoll_fd, new_fd, &new_handler.client_sock_handler) catch |err| switch (err) {
+            error.SystemResources,
+            error.UserResourceLimitReached,
+            => |e| {
+                std.log.err("s={}: epoll add failed with {s}", .{new_fd, @errorName(e)});
+                return error.Handled;
+            },
+            error.FileDescriptorIncompatibleWithEpoll,
+            error.FileDescriptorAlreadyPresentInSet,
+            error.OperationCausesCircularLoop,
+            error.FileDescriptorNotRegistered,
+            error.Unexpected,
+            => unreachable,
+        };
+        epollAddHandler(self.epoll_fd, forward_sock, &new_handler.server_sock_handler) catch |err| switch (err) {
+            error.SystemResources,
+            error.UserResourceLimitReached,
+            => |e| {
+                std.log.err("s={}: epoll add failed with {s}", .{new_fd, @errorName(e)});
+                return error.Handled;
+            },
+            error.FileDescriptorIncompatibleWithEpoll,
+            error.FileDescriptorAlreadyPresentInSet,
+            error.OperationCausesCircularLoop,
+            error.FileDescriptorNotRegistered,
+            error.Unexpected,
+            => unreachable,
+        };
+        std.log.info("s={}: new connection", .{new_fd});
+    }
 };
 
-fn epollAdd(epoll_fd: os.fd_t, op: u32, fd: os.fd_t, events: u32, handler: EpollHandler) !void {
-    var event = os.linux.epoll_event{
-        .events = events,
-        .data = .{ .@"u32" = @enumToInt(handler) },
-    };
-    return os.epoll_ctl(epoll_fd, op, fd, &event);
-}
+const DataSockHandler = struct {
+    client_sock_handler: EpollHandler = .{ .handle = handleClient },
+    server_sock_handler: EpollHandler = .{ .handle = handleServer },
+    allocator: std.mem.Allocator,
+    client_sock: os.socket_t,
+    forward_sock: os.socket_t,
+    partial: std.ArrayListAlignedUnmanaged(u8, 8) = .{},
+    state: union(enum) {
+        auth: struct {
+            authenticated: bool = false,
+        },
+        begun: void,
+    } = .{ .auth = .{} },
 
-fn onListenSock(epoll_fd: os.fd_t, sock: os.socket_t, opt_data_sock_ptr: *os.socket_t) !void {
-    var from: os.sockaddr.un = undefined;
-    var from_len: os.socklen_t = @sizeOf(@TypeOf(from));
-
-    const client = try os.accept(sock, @ptrCast(*os.sockaddr, &from), &from_len, 0);
-    //var from_path_len = from_len - @offsetOf(os.sockaddr.un, "path");
-    //if (from_path_len > 0) from_path_len -= 1;
-    //var from_path = from.path[0 .. from_path_len];
-    if (opt_data_sock_ptr.* != -1) {
-        std.log.info("dropping client s={}, already have one", .{client});
-        // TODO: call shutdown?
-        os.close(client);
-    } else {
-        std.log.info("new client s={}", .{client});
-        try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, client, os.linux.EPOLL.IN, .data_sock);
-        opt_data_sock_ptr.* = client;
+    fn deinit(self: *DataSockHandler) void {
+        os.close(self.forward_sock);
+        os.close(self.client_sock);
+        self.partial.deinit(self.allocator);
+        self.allocator.destroy(self);
     }
-}
 
-fn onDataSock(sock: *os.socket_t) !void {
-    std.log.info("todo: recv on s={}", .{sock.*});
-    var buf: [std.mem.page_size]u8 = undefined;
-    const len = os.read(sock.*, &buf) catch |err| {
-        std.log.info("s={} read failed with {s}", .{sock.*, @errorName(err)});
-        os.close(sock.*);
-        sock.* = -1;
-        return;
-    };
-    if (len == 0) {
-        std.log.info("s={} EOF", .{sock.*});
-        os.close(sock.*);
-        sock.* = -1;
-        return;
+    fn forward(self: *DataSockHandler, src: os.fd_t, dst: os.fd_t) !void {
+        var buf: [std.mem.page_size]u8 = undefined;
+        const len = os.read(src, &buf) catch |err| {
+            std.log.err("{} > {}: read failed with {s}, closing", .{src, dst, @errorName(err)});
+            self.deinit();
+            return;
+        };
+        if (len == 0) {
+            std.log.info("{} > {}: EOF", .{src, dst});
+            self.deinit();
+            return;
+        }
+        const sent = os.write(dst, buf[0..len]) catch |err| {
+            std.log.err("{} > {}: write {} bytes failed with {s}", .{src, dst, len, @errorName(err)});
+            self.deinit();
+            return;
+        };
+        if (sent != len) {
+            std.log.err("{} > {}: write {} bytes returned {}", .{src, dst, len, sent});
+            self.deinit();
+            return;
+        }
+        std.log.info("{} > {}: {} bytes", .{src, dst, len});
     }
-    std.log.info("s={} read {} bytes: {}", .{sock.*, len, std.zig.fmtEscapes(buf[0..len])});
-}
+    fn handleServer(forward_base: *EpollHandler) !void {
+        const self = @fieldParentPtr(DataSockHandler, "server_sock_handler", forward_base);
+        try self.forward(self.forward_sock, self.client_sock);
+    }
+    fn handleClient(base: *EpollHandler) !void {
+        const self = @fieldParentPtr(DataSockHandler, "client_sock_handler", base);
+        try self.forward(self.client_sock, self.forward_sock);
+    }
+};
 
 fn fileExistsAbsolute(path: []const u8) !bool {
     std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
