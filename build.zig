@@ -10,14 +10,15 @@ pub fn build(b: *std.build.Builder) void {
         .branch = null,
         .sha = "5a46e3ee7956739dc678efd82e4fe04b4d349cd2",
     });
-    // TODO: use this
-    _ = zigx_repo;
 
     {
         const exe = b.addExecutable("xremoteview", "xremoteview.zig");
         exe.setTarget(target);
         exe.setBuildMode(mode);
         exe.install();
+
+        exe.step.dependOn(&zigx_repo.step);
+        exe.addPackagePath("x", b.pathJoin(&.{ zigx_repo.getPath(&exe.step), "x.zig" }));
 
         const run_cmd = exe.run();
         run_cmd.step.dependOn(b.getInstallStep());

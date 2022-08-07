@@ -4,37 +4,11 @@
 const std = @import("std");
 const os = std.os;
 
+const common = @import("common.zig");
+
 const global = struct {
     pub var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 };
-
-fn initUnixAddr(path: []const u8) error{PathTooLong}!os.sockaddr.un {
-    var result: os.sockaddr.un = .{ .family = os.AF.UNIX, .path = undefined };
-    if (path.len + 1 > result.path.len) return error.PathTooLong;
-    std.mem.copy(u8, &result.path, path);
-    result.path[path.len] = 0;
-    return result;
-}
-
-fn createServer(listen_path: []const u8) !os.socket_t {
-    const addr = try initUnixAddr(listen_path);
-
-    const sock = try os.socket(os.AF.UNIX, os.SOCK.STREAM, 0);
-    errdefer os.close(sock);
-
-    try os.bind(sock, @ptrCast(*const os.sockaddr, &addr), @sizeOf(@TypeOf(addr)));
-    try os.listen(sock, 0);
-    return sock;
-}
-fn connectXserver() !os.socket_t {
-    // TODO: hardcoded path for now
-    const addr = try initUnixAddr("/tmp/.X11-unix/X0");
-    const sock = try os.socket(os.AF.UNIX, os.SOCK.STREAM, 0);
-    errdefer os.close(sock);
-
-    try os.connect(sock, @ptrCast(*const os.sockaddr, &addr), @sizeOf(@TypeOf(addr)));
-    return sock;
-}
 
 pub fn main() !u8 {
     //const args = try std.process.argsAlloc(global.arena.allocator());
@@ -52,7 +26,7 @@ pub fn main() !u8 {
         try std.fs.deleteFileAbsolute(listen_path);
     }
 
-    const listen_sock = try createServer(listen_path);
+    const listen_sock = try common.createServer(listen_path);
     std.log.info("listening at '{s}', DISPLAY=:8", .{listen_path});
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}) {};
@@ -126,7 +100,7 @@ const ListenSockHandler = struct {
         };
         errdefer os.close(new_fd);
 
-        const forward_sock = try connectXserver();
+        const forward_sock = try common.connectXserver();
 
         const new_handler = self.allocator.create(DataSockHandler) catch |err| switch (err) {
             error.OutOfMemory => {
