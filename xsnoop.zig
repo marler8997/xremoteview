@@ -10,6 +10,19 @@ const global = struct {
     pub var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 };
 
+fn connectRemoteView(addr: u32, port: u16) !os.socket_t {
+    var sockaddr: os.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, addr),
+        .zero = undefined,
+    };
+    const sock = try os.socket(sockaddr.family, os.SOCK.STREAM, os.IPPROTO.TCP);
+    errdefer os.close(sock);
+
+    try os.connect(sock, @ptrCast(*const os.sockaddr, &sockaddr), @sizeOf(@TypeOf(sockaddr)));
+    return sock;
+}
+
 pub fn main() !u8 {
     //const args = try std.process.argsAlloc(global.arena.allocator());
 
@@ -18,10 +31,17 @@ pub fn main() !u8 {
         return 0xff;
     };
 
+    // just hardcode address for now
+    const remote_view_addr: u32 = 0x7f000001;
+    const remote_view_sock = try connectRemoteView(remote_view_addr, 1234);
+    defer {
+        os.shutdown(remote_view_sock, .both) catch {};
+    }
+
     // just hardcode for now
     const listen_path = "/tmp/.X11-unix/X8";
 
-    if (try fileExistsAbsolute(listen_path)) {
+    if (try common.fileExistsAbsolute(listen_path)) {
         std.log.info("rm {s}", .{listen_path});
         try std.fs.deleteFileAbsolute(listen_path);
     }
@@ -33,6 +53,7 @@ pub fn main() !u8 {
     //defer gpa.deinit();
 
     var listen_sock_handler = ListenSockHandler{
+        .remote_view_sock = remote_view_sock,
         .epoll_fd = epoll_fd,
         .allocator = gpa.allocator(),
         .sock = listen_sock,
@@ -67,8 +88,17 @@ fn epollAddHandler(epoll_fd: os.fd_t, fd: os.fd_t, handler: *EpollHandler) !void
     try os.epoll_ctl(epoll_fd, os.linux.EPOLL.CTL_ADD, fd, &event);
 }
 
+pub fn sendAll(sock: os.socket_t, data: []const u8) !void {
+    const sent = try os.send(sock, data, 0);
+    if (sent != data.len) {
+        std.log.err("send {} only sent {}\n", .{data.len, sent});
+        return error.DidNotSendAllData;
+    }
+}
+
 const ListenSockHandler = struct {
     base: EpollHandler = .{ .handle = handle },
+    remote_view_sock: os.socket_t,
     epoll_fd: os.fd_t,
     allocator: std.mem.Allocator,
     sock: os.socket_t,
@@ -143,6 +173,7 @@ const ListenSockHandler = struct {
             => unreachable,
         };
         std.log.info("s={}: new connection", .{new_fd});
+        try sendAll(self.remote_view_sock, "new client!\n");
     }
 };
 
@@ -200,11 +231,3 @@ const DataSockHandler = struct {
         try self.forward(self.client_sock, self.forward_sock);
     }
 };
-
-fn fileExistsAbsolute(path: []const u8) !bool {
-    std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => |e| return e,
-    };
-    return true;
-}

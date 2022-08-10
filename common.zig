@@ -29,3 +29,11 @@ pub fn connectXserver() !os.socket_t {
     try os.connect(sock, @ptrCast(*const os.sockaddr, &addr), @sizeOf(@TypeOf(addr)));
     return sock;
 }
+
+pub fn fileExistsAbsolute(path: []const u8) !bool {
+    std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => |e| return e,
+    };
+    return true;
+}

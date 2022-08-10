@@ -7,21 +7,77 @@ const os = std.os;
 
 const x = @import("x");
 
+const common = @import("common.zig");
+
 const global = struct {
     pub var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     pub const window_width = 600;
     pub const window_height = 400;
 };
 
+fn createTcpServer(port: u16) !os.socket_t {
+    var addr: os.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = 0,
+        .zero = undefined,
+    };
+    const sock = try os.socket(addr.family, os.SOCK.STREAM, os.IPPROTO.TCP);
+    errdefer os.close(sock);
+
+    // TODO: setsockopt reuse addr?
+
+    try os.bind(sock, @ptrCast(*const os.sockaddr, &addr), @sizeOf(@TypeOf(addr)));
+    try os.listen(sock, 0);
+    return sock;
+}
+
 pub fn main() !void {
+
+    // just hardcode for now
+    const port = 1234;
+    const listen_sock = try createTcpServer(1234);
+    std.log.info("listening on port {}", .{port});
+
     var xconn_mut = XConn.Mutable.init();
     const xconn = try xConnect(&xconn_mut);
     defer xconn.shutdown();
 
+    const epoll_fd = try os.epoll_create1(os.linux.EPOLL.CLOEXEC);
+    try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, listen_sock, os.linux.EPOLL.IN, .listen_sock);
+    try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, xconn.sock, os.linux.EPOLL.IN, .xconn);
+
     while (true) {
-        try onXServerRead(xconn, &xconn_mut);
-    }
+        var events: [10]os.linux.epoll_event = undefined;
+        const event_count = os.epoll_wait(epoll_fd, &events, -1);
+        for (events[0..event_count]) |*event| {
+            switch (@intToEnum(EpollHandler, event.data.@"u32")) {
+                .xconn => try onXServerRead(xconn, &xconn_mut),
+                .listen_sock => try onListenSock(listen_sock),
+            }
+        }
+    }}
+
+
+const EpollHandler = enum {
+    xconn,
+    listen_sock,
+};
+fn epollAdd(epoll_fd: os.fd_t, op: u32, fd: os.fd_t, events: u32, handler: EpollHandler) !void {
+    var event = os.linux.epoll_event{
+        .events = events,
+        .data = .{ .@"u32" = @enumToInt(handler) },
+    };
+    return os.epoll_ctl(epoll_fd, op, fd, &event);
 }
+
+fn onListenSock(listen_sock: os.socket_t) !void {
+    var addr: os.sockaddr.un = undefined;
+    var len: os.socklen_t = @sizeOf(@TypeOf(addr));
+    const new_sock = try os.accept(listen_sock, @ptrCast(*os.sockaddr, &addr), &len, os.SOCK.CLOEXEC);
+    std.log.info("new client {}", .{new_sock});
+    os.close(new_sock);
+}
+
 
 const XConn = struct {
     pub const Mutable = struct {
@@ -39,14 +95,14 @@ const XConn = struct {
         fg_gc_id: u32,
         font_dims: FontDims,
         pub fn shutdown(self: Const) void {
-            std.os.shutdown(self.sock, .both) catch {};
+            os.shutdown(self.sock, .both) catch {};
         }
     };
 };
 
 fn xConnect(mut: *XConn.Mutable) !XConn.Const {
     const conn = try connect(global.arena.allocator());
-    errdefer std.os.shutdown(conn.sock, .both) catch {};
+    errdefer os.shutdown(conn.sock, .both) catch {};
 
     const screen = blk: {
         const fixed = conn.setup.fixed();
@@ -198,7 +254,7 @@ fn onXServerRead(
             std.log.err("buffer size {} not big enough!", .{mut.buf.half_size});
             os.exit(0xff);
         }
-        const len = try std.os.recv(conn.sock, recv_buf, 0);
+        const len = try os.recv(conn.sock, recv_buf, 0);
         if (len == 0) {
             std.log.info("X server connection closed", .{});
             os.exit(0);
@@ -267,7 +323,7 @@ const FontDims = struct {
 };
 
 
-fn render(sock: std.os.socket_t, drawable_id: u32, bg_gc_id: u32, fg_gc_id: u32, font_dims: FontDims) !void {
+fn render(sock: os.socket_t, drawable_id: u32, bg_gc_id: u32, fg_gc_id: u32, font_dims: FontDims) !void {
     _ = bg_gc_id;
     {
         var msg: [x.clear_area.len]u8 = undefined;
@@ -294,13 +350,13 @@ fn render(sock: std.os.socket_t, drawable_id: u32, bg_gc_id: u32, fg_gc_id: u32,
     }
 }
 
-fn readSocket(sock: std.os.socket_t, buffer: []u8) !usize {
-    return std.os.recv(sock, buffer, 0);
+fn readSocket(sock: os.socket_t, buffer: []u8) !usize {
+    return os.recv(sock, buffer, 0);
 }
-pub const SocketReader = std.io.Reader(std.os.socket_t, std.os.RecvFromError, readSocket);
+pub const SocketReader = std.io.Reader(os.socket_t, os.RecvFromError, readSocket);
 
-pub fn sendAll(sock: std.os.socket_t, data: []const u8) !void {
-    const sent = try std.os.send(sock, data, 0);
+pub fn sendAll(sock: os.socket_t, data: []const u8) !void {
+    const sent = try os.send(sock, data, 0);
     if (sent != data.len) {
         std.log.err("send {} only sent {}\n", .{data.len, sent});
         return error.DidNotSendAllData;
@@ -308,7 +364,7 @@ pub fn sendAll(sock: std.os.socket_t, data: []const u8) !void {
 }
 
 pub const ConnectResult = struct {
-    sock: std.os.socket_t,
+    sock: os.socket_t,
     setup: x.ConnectSetup,
     pub fn reader(self: ConnectResult) SocketReader {
         return .{ .context = self.sock };
@@ -320,7 +376,7 @@ pub fn connect(allocator: std.mem.Allocator) !ConnectResult {
 
     const sock = x.connect(display) catch |err| {
         std.log.err("failed to connect to display '{s}': {s}", .{display, @errorName(err)});
-        std.os.exit(0xff);
+        os.exit(0xff);
     };
 
     {
