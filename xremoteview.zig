@@ -14,8 +14,39 @@ const global = struct {
 };
 
 pub fn main() !void {
+    var xconn_mut = XConn.Mutable.init();
+    const xconn = try xConnect(&xconn_mut);
+    defer xconn.shutdown();
+
+    while (true) {
+        try onXServerRead(xconn, &xconn_mut);
+    }
+}
+
+const XConn = struct {
+    pub const Mutable = struct {
+        buf: x.ContiguousReadBuffer,
+        pub fn init() Mutable {
+            return .{
+                .buf = undefined,
+            };
+        }
+    };
+    pub const Const = struct {
+        sock: os.socket_t,
+        window_id: u32,
+        bg_gc_id: u32,
+        fg_gc_id: u32,
+        font_dims: FontDims,
+        pub fn shutdown(self: Const) void {
+            std.os.shutdown(self.sock, .both) catch {};
+        }
+    };
+};
+
+fn xConnect(mut: *XConn.Mutable) !XConn.Const {
     const conn = try connect(global.arena.allocator());
-    defer std.os.shutdown(conn.sock, .both) catch {};
+    errdefer std.os.shutdown(conn.sock, .both) catch {};
 
     const screen = blk: {
         const fixed = conn.setup.fixed();
@@ -121,11 +152,11 @@ pub fn main() !void {
     // no need to deinit
     const buffer_capacity = std.mem.alignForward(1000, std.mem.page_size);
     std.log.info("buffer capacity is {}", .{buffer_capacity});
-    var buf = x.ContiguousReadBuffer { .double_buffer_ptr = try buf_memfd.toDoubleBuffer(buffer_capacity), .half_size = buffer_capacity };
+    mut.buf = x.ContiguousReadBuffer { .double_buffer_ptr = try buf_memfd.toDoubleBuffer(buffer_capacity), .half_size = buffer_capacity };
 
     const font_dims: FontDims = blk: {
-        _ = try x.readOneMsg(conn.reader(), @alignCast(4, buf.nextReadBuffer()));
-        switch (x.serverMsgTaggedUnion(@alignCast(4, buf.double_buffer_ptr))) {
+        _ = try x.readOneMsg(conn.reader(), @alignCast(4, mut.buf.nextReadBuffer()));
+        switch (x.serverMsgTaggedUnion(@alignCast(4, mut.buf.double_buffer_ptr))) {
             .reply => |msg_reply| {
                 const msg = @ptrCast(*x.ServerMsg.QueryTextExtents, msg_reply);
                 break :blk .{
@@ -148,71 +179,82 @@ pub fn main() !void {
         try sendAll(conn.sock, &msg);
     }
 
-    while (true) {
-        {
-            const recv_buf = buf.nextReadBuffer();
-            if (recv_buf.len == 0) {
-                std.log.err("buffer size {} not big enough!", .{buf.half_size});
-                os.exit(0xff);
-            }
-            const len = try std.os.recv(conn.sock, recv_buf, 0);
-            if (len == 0) {
-                std.log.info("X server connection closed", .{});
-                os.exit(0);
-            }
-            buf.reserve(len);
+    return XConn.Const{
+        .sock = conn.sock,
+        .window_id = window_id,
+        .bg_gc_id = bg_gc_id,
+        .fg_gc_id = fg_gc_id,
+        .font_dims = font_dims,
+    };
+}
+
+fn onXServerRead(
+    conn: XConn.Const,
+    mut: *XConn.Mutable,
+) !void {
+    {
+        const recv_buf = mut.buf.nextReadBuffer();
+        if (recv_buf.len == 0) {
+            std.log.err("buffer size {} not big enough!", .{mut.buf.half_size});
+            os.exit(0xff);
         }
-        while (true) {
-            const data = buf.nextReservedBuffer();
-            const msg_len = x.parseMsgLen(@alignCast(4, data));
-            if (msg_len == 0)
-                break;
-            buf.release(msg_len);
-            //buf.resetIfEmpty();
-            switch (x.serverMsgTaggedUnion(@alignCast(4, data.ptr))) {
-                .err => |msg| {
-                    std.log.err("{}", .{msg});
-                    os.exit(0xff);
-                },
-                .reply => |msg| {
-                    std.log.info("todo: handle a reply message {}", .{msg});
-                    return error.TodoHandleReplyMessage;
-                },
-                .key_press => |msg| {
-                    std.log.info("key_press: {}", .{msg.detail});
-                },
-                .key_release => |msg| {
-                    std.log.info("key_release: {}", .{msg.detail});
-                },
-                .button_press => |msg| {
-                    std.log.info("button_press: {}", .{msg});
-                },
-                .button_release => |msg| {
-                    std.log.info("button_release: {}", .{msg});
-                },
-                .enter_notify => |msg| {
-                    std.log.info("enter_window: {}", .{msg});
-                },
-                .leave_notify => |msg| {
-                    std.log.info("leave_window: {}", .{msg});
-                },
-                .motion_notify => |msg| {
-                    // too much logging
-                    _ = msg;
-                    //std.log.info("pointer_motion: {}", .{msg});
-                },
-                .keymap_notify => |msg| {
-                    std.log.info("keymap_state: {}", .{msg});
-                },
-                .expose => |msg| {
-                    std.log.info("expose: {}", .{msg});
-                    try render(conn.sock, window_id, bg_gc_id, fg_gc_id, font_dims);
-                },
-                .unhandled => |msg| {
-                    std.log.info("todo: server msg {}", .{msg});
-                    return error.UnhandledServerMsg;
-                },
-            }
+        const len = try std.os.recv(conn.sock, recv_buf, 0);
+        if (len == 0) {
+            std.log.info("X server connection closed", .{});
+            os.exit(0);
+        }
+        mut.buf.reserve(len);
+    }
+    while (true) {
+        const data = mut.buf.nextReservedBuffer();
+        const msg_len = x.parseMsgLen(@alignCast(4, data));
+        if (msg_len == 0)
+            break;
+        mut.buf.release(msg_len);
+        //mut.buf.resetIfEmpty();
+        switch (x.serverMsgTaggedUnion(@alignCast(4, data.ptr))) {
+            .err => |msg| {
+                std.log.err("{}", .{msg});
+                os.exit(0xff);
+            },
+            .reply => |msg| {
+                std.log.info("todo: handle a reply message {}", .{msg});
+                return error.TodoHandleReplyMessage;
+            },
+            .key_press => |msg| {
+                std.log.info("key_press: {}", .{msg.detail});
+            },
+            .key_release => |msg| {
+                std.log.info("key_release: {}", .{msg.detail});
+            },
+            .button_press => |msg| {
+                std.log.info("button_press: {}", .{msg});
+            },
+            .button_release => |msg| {
+                std.log.info("button_release: {}", .{msg});
+            },
+            .enter_notify => |msg| {
+                std.log.info("enter_window: {}", .{msg});
+            },
+            .leave_notify => |msg| {
+                std.log.info("leave_window: {}", .{msg});
+            },
+            .motion_notify => |msg| {
+                // too much logging
+                _ = msg;
+                //std.log.info("pointer_motion: {}", .{msg});
+            },
+            .keymap_notify => |msg| {
+                std.log.info("keymap_state: {}", .{msg});
+            },
+            .expose => |msg| {
+                std.log.info("expose: {}", .{msg});
+                try render(conn.sock, conn.window_id, conn.bg_gc_id, conn.fg_gc_id, conn.font_dims);
+            },
+            .unhandled => |msg| {
+                std.log.info("todo: server msg {}", .{msg});
+                return error.UnhandledServerMsg;
+            },
         }
     }
 }
