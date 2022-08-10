@@ -24,16 +24,51 @@ fn connectRemoteView(addr: u32, port: u16) !os.socket_t {
 }
 
 pub fn main() !u8 {
-    //const args = try std.process.argsAlloc(global.arena.allocator());
+    const all_args = try std.process.argsAlloc(global.arena.allocator());
+    var opt: struct {
+        snoop_sock: ?os.socket_t = null,
+    } = .{};
+
+    const args = blk: {
+        const args = if (all_args.len == 0) all_args else all_args[1..];
+        var new_arg_count: usize = 0;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (!std.mem.startsWith(u8, arg, "-")) {
+                args[new_arg_count] = arg;
+                new_arg_count += 1;
+            } else if (std.mem.eql(u8, arg, "--snoop-sock")) {
+                const str = std.mem.span(common.getCmdlineOption(args, &i));
+                opt.snoop_sock = std.fmt.parseInt(os.fd_t, str, 10) catch |err| {
+                    std.log.err("--snoop-sock '{s}' is not an fd number: {s}", .{str, @errorName(err)});
+                    os.exit(0xff);
+                };
+            } else {
+                std.log.err("unknown cmdline option '{s}'", .{arg});
+                os.exit(0xff);
+            }
+        }
+        break :blk args[0 .. new_arg_count];
+    };
+    if (args.len != 0) {
+        std.log.err("too many cmdline arguments", .{});
+        os.exit(0xff);
+    }
 
     const epoll_fd = os.epoll_create1(os.linux.EPOLL.CLOEXEC) catch |err| {
         std.log.err("epoll_create failed with {s}", .{@errorName(err)});
         return 0xff;
     };
 
-    // just hardcode address for now
-    const remote_view_addr: u32 = 0x7f000001;
-    const remote_view_sock = try connectRemoteView(remote_view_addr, 1234);
+    const remote_view_sock = blk: {
+        if (opt.snoop_sock) |snoop_sock| {
+            break :blk snoop_sock;
+        }
+        // just hardcode address for now
+        const remote_view_addr: u32 = 0x7f000001;
+        break :blk try connectRemoteView(remote_view_addr, 1234);
+    };
     defer {
         os.shutdown(remote_view_sock, .both) catch {};
     }

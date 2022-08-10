@@ -1,6 +1,15 @@
 const std = @import("std");
 const os = std.os;
 
+pub fn getCmdlineOption(args: anytype, i: *usize) @TypeOf(args[0]) {
+    i.* += 1;
+    if (i.* >= args.len) {
+        std.log.err("command-line option '{s}' requires an argument", .{args[i.*-1]});
+        os.exit(0xff);
+    }
+    return args[i.*];
+}
+
 pub fn initUnixAddr(path: []const u8) error{PathTooLong}!os.sockaddr.un {
     var result: os.sockaddr.un = .{ .family = os.AF.UNIX, .path = undefined };
     if (path.len + 1 > result.path.len) return error.PathTooLong;

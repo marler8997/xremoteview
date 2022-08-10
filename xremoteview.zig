@@ -32,18 +32,59 @@ fn createTcpServer(port: u16) !os.socket_t {
 }
 
 pub fn main() !void {
+    const all_args = try std.process.argsAlloc(global.arena.allocator());
+    var opt: struct {
+        snoop_sock: ?os.socket_t = null,
+    } = .{};
 
-    // just hardcode for now
-    const port = 1234;
-    const listen_sock = try createTcpServer(1234);
-    std.log.info("listening on port {}", .{port});
+    const args = blk: {
+        const args = if (all_args.len == 0) all_args else all_args[1..];
+        var new_arg_count: usize = 0;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (!std.mem.startsWith(u8, arg, "-")) {
+                args[new_arg_count] = arg;
+                new_arg_count += 1;
+            } else if (std.mem.eql(u8, arg, "--snoop-sock")) {
+                const str = std.mem.span(common.getCmdlineOption(args, &i));
+                opt.snoop_sock = std.fmt.parseInt(os.fd_t, str, 10) catch |err| {
+                    std.log.err("--snoop-sock '{s}' is not an fd number: {s}", .{str, @errorName(err)});
+                    os.exit(0xff);
+                };
+            } else {
+                std.log.err("unknown cmdline option '{s}'", .{arg});
+                os.exit(0xff);
+            }
+        }
+        break :blk args[0 .. new_arg_count];
+    };
+    if (args.len != 0) {
+        std.log.err("too many cmdline arguments", .{});
+        os.exit(0xff);
+    }
+
+    const epoll_fd = try os.epoll_create1(os.linux.EPOLL.CLOEXEC);
+
+    var listen_sock: os.socket_t = undefined;
+    var snoop_sock: ?os.socket_t = null;
+
+    if (opt.snoop_sock) |sock| {
+        snoop_sock = sock;
+        std.log.info("xsnoop connection from --snoop-sock, s={}", .{sock});
+        try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, sock, os.linux.EPOLL.IN, .snoop_sock);
+    } else {
+        // just hardcode for now
+        const port = 1234;
+        listen_sock = try createTcpServer(1234);
+        std.log.info("listening on port {}", .{port});
+        try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, listen_sock, os.linux.EPOLL.IN, .listen_sock);
+    }
 
     var xconn_mut = XConn.Mutable.init();
     const xconn = try xConnect(&xconn_mut);
     defer xconn.shutdown();
 
-    const epoll_fd = try os.epoll_create1(os.linux.EPOLL.CLOEXEC);
-    try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, listen_sock, os.linux.EPOLL.IN, .listen_sock);
     try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, xconn.sock, os.linux.EPOLL.IN, .xconn);
 
     while (true) {
@@ -52,15 +93,17 @@ pub fn main() !void {
         for (events[0..event_count]) |*event| {
             switch (@intToEnum(EpollHandler, event.data.@"u32")) {
                 .xconn => try onXServerRead(xconn, &xconn_mut),
-                .listen_sock => try onListenSock(listen_sock),
+                .listen_sock => try onListenSock(epoll_fd, listen_sock, &snoop_sock),
+                .snoop_sock => try onSnoopSock(&snoop_sock),
             }
         }
-    }}
-
+    }
+}
 
 const EpollHandler = enum {
     xconn,
     listen_sock,
+    snoop_sock,
 };
 fn epollAdd(epoll_fd: os.fd_t, op: u32, fd: os.fd_t, events: u32, handler: EpollHandler) !void {
     var event = os.linux.epoll_event{
@@ -70,14 +113,35 @@ fn epollAdd(epoll_fd: os.fd_t, op: u32, fd: os.fd_t, events: u32, handler: Epoll
     return os.epoll_ctl(epoll_fd, op, fd, &event);
 }
 
-fn onListenSock(listen_sock: os.socket_t) !void {
+fn onListenSock(
+    epoll_fd: os.fd_t,
+    listen_sock: os.socket_t,
+    snoop_sock_ref: *?os.socket_t,
+) !void {
     var addr: os.sockaddr.un = undefined;
     var len: os.socklen_t = @sizeOf(@TypeOf(addr));
     const new_sock = try os.accept(listen_sock, @ptrCast(*os.sockaddr, &addr), &len, os.SOCK.CLOEXEC);
-    std.log.info("new client {}", .{new_sock});
-    os.close(new_sock);
+    errdefer {
+        os.shutdown(new_sock, .both) catch {};
+        os.close(new_sock);
+    }
+    if (snoop_sock_ref.*) |_| {
+        std.log.info("already have xsnoop connection, closing s={}", .{new_sock});
+        os.shutdown(new_sock, .both) catch {};
+        os.close(new_sock);
+        return;
+    }
+    std.log.info("xsnoop connected, s={}", .{new_sock});
+    try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, new_sock, os.linux.EPOLL.IN, .snoop_sock);
+    snoop_sock_ref.* = new_sock;
 }
 
+fn onSnoopSock(
+    snoop_sock_ref: *?os.socket_t,
+) !void {
+    _ = snoop_sock_ref;
+    @panic("not impl");
+}
 
 const XConn = struct {
     pub const Mutable = struct {
@@ -333,7 +397,7 @@ fn render(sock: os.socket_t, drawable_id: u32, bg_gc_id: u32, fg_gc_id: u32, fon
         try sendAll(sock, &msg);
     }
     {
-        const text_literal: []const u8 = "no clients";
+        const text_literal: []const u8 = "waiting for xsnoop";
         const text = x.Slice(u8, [*]const u8) { .ptr = text_literal.ptr, .len = text_literal.len };
         var msg: [x.image_text8.getLen(text.len)]u8 = undefined;
 
