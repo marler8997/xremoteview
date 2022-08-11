@@ -5,6 +5,7 @@ const std = @import("std");
 const os = std.os;
 
 const common = @import("common.zig");
+const snoopproto = @import("snoopproto.zig");
 
 const global = struct {
     pub var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -208,7 +209,7 @@ const ListenSockHandler = struct {
             => unreachable,
         };
         std.log.info("s={}: new connection", .{new_fd});
-        try sendAll(self.remote_view_sock, "new client!\n");
+        try sendAll(self.remote_view_sock, &snoopproto.new_connection);
     }
 };
 

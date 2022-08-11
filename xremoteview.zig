@@ -68,7 +68,6 @@ pub fn main() !void {
 
     var listen_sock: os.socket_t = undefined;
     var snoop_sock: ?os.socket_t = null;
-
     if (opt.snoop_sock) |sock| {
         snoop_sock = sock;
         std.log.info("xsnoop connection from --snoop-sock, s={}", .{sock});
@@ -87,6 +86,7 @@ pub fn main() !void {
 
     try epollAdd(epoll_fd, os.linux.EPOLL.CTL_ADD, xconn.sock, os.linux.EPOLL.IN, .xconn);
 
+    var snoop_data = std.BoundedArray(u8, snoop_recv_len){ };
     while (true) {
         var events: [10]os.linux.epoll_event = undefined;
         const event_count = os.epoll_wait(epoll_fd, &events, -1);
@@ -94,7 +94,7 @@ pub fn main() !void {
             switch (@intToEnum(EpollHandler, event.data.@"u32")) {
                 .xconn => try onXServerRead(xconn, &xconn_mut),
                 .listen_sock => try onListenSock(epoll_fd, listen_sock, &snoop_sock),
-                .snoop_sock => try onSnoopSock(&snoop_sock),
+                .snoop_sock => try onSnoopSock(&snoop_sock, &snoop_data),
             }
         }
     }
@@ -136,11 +136,51 @@ fn onListenSock(
     snoop_sock_ref.* = new_sock;
 }
 
+const snoop_recv_len = 2000;
+
 fn onSnoopSock(
     snoop_sock_ref: *?os.socket_t,
+    data: *std.BoundedArray(u8, snoop_recv_len),
 ) !void {
-    _ = snoop_sock_ref;
-    @panic("not impl");
+    const snoop_sock = snoop_sock_ref.* orelse unreachable;
+
+    const unused = data.unusedCapacitySlice();
+    std.debug.assert(unused.len > 0);
+    const len = os.read(snoop_sock, unused) catch |err| {
+        std.log.err("read snoop sock failed with {s}, closing", .{@errorName(err)});
+        os.shutdown(snoop_sock, .both) catch {};
+        os.close(snoop_sock);
+        snoop_sock_ref.* = null;
+        return;
+    };
+    if (len == 0) {
+        std.log.info("snoop sock EOF", .{});
+        os.shutdown(snoop_sock, .both) catch {};
+        os.close(snoop_sock);
+        snoop_sock_ref.* = null;
+        return;
+    }
+    std.log.info("got {} bytes from snoop sock", .{len});
+    data.len += len;
+
+    var total_processed: usize = 0;
+    while (true) {
+        const processed = try processSnoop(data.buffer[total_processed .. data.len]);
+        if (processed == 0) break;
+        total_processed += processed;
+    }
+
+    const leftover = data.len - total_processed;
+    if (leftover > 0) {
+        std.mem.copy(u8, &data.buffer, data.buffer[total_processed..data.len]);
+        data.len = leftover;
+    }
+}
+
+fn processSnoop(data: []const u8) !usize {
+    if (data.len < 4) return 0;
+    std.log.info("todo: process {} bytes of snoop data", .{data.len});
+    return data.len;
 }
 
 const XConn = struct {
@@ -307,6 +347,7 @@ fn xConnect(mut: *XConn.Mutable) !XConn.Const {
         .font_dims = font_dims,
     };
 }
+
 
 fn onXServerRead(
     conn: XConn.Const,
